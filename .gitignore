@@ -1,0 +1,19 @@
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# MQTT captures (contain sensitive data)
+capture/
+*.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
