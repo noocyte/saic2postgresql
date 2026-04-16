@@ -1,0 +1,54 @@
+package main
+
+import (
+	"context"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
+)
+
+func main() {
+	// Structured JSON logging to stdout
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})))
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		slog.Error("failed to load config", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("config loaded",
+		"mqtt_broker", cfg.MQTTBroker,
+		"mqtt_topic_prefix", cfg.MQTTTopicPrefix,
+		"drive_end_debounce_seconds", cfg.DriveEndDebounceSeconds,
+	)
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	pool, err := InitDB(ctx, cfg.DBURI)
+	if err != nil {
+		slog.Error("failed to initialize database", "error", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	vs := NewVehicleState(pool, cfg)
+	if err := vs.Recover(ctx); err != nil {
+		slog.Warn("state recovery encountered an issue (continuing)", "error", err)
+	}
+
+	slog.Info("starting MQTT connection")
+	if err := StartMQTT(ctx, cfg, vs); err != nil {
+		if ctx.Err() != nil {
+			slog.Info("shutting down gracefully")
+		} else {
+			slog.Error("mqtt error", "error", err)
+			os.Exit(1)
+		}
+	}
+
+	slog.Info("shutdown complete")
+}

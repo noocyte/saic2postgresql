@@ -7,10 +7,10 @@
 *.test
 *.out
 vendor/
+saic-logger
 
 # MQTT captures (contain sensitive data)
 capture/
-*.txt
 
 # IDE
 .idea/
