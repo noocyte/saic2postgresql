@@ -52,11 +52,13 @@ done
 
 # --- Create and push manifests ---
 echo "==> Creating manifest ${MANIFEST}..."
-podman manifest create --replace "${MANIFEST}" "${IMAGES[@]}"
+podman manifest rm "${MANIFEST}" 2>/dev/null || true
+podman manifest create "${MANIFEST}" "${IMAGES[@]}"
 podman manifest push "${MANIFEST}" "docker://${MANIFEST}"
 
 echo "==> Tagging as ${REPO}:latest..."
-podman manifest create --replace "${REPO}:latest" "${IMAGES[@]}"
+podman manifest rm "${REPO}:latest" 2>/dev/null || true
+podman manifest create "${REPO}:latest" "${IMAGES[@]}"
 podman manifest push "${REPO}:latest" "docker://${REPO}:latest"
 
 # --- Cleanup per-arch tags ---
