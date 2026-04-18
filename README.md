@@ -12,6 +12,7 @@ The SAIC MQTT gateway publishes ~80 individual values per refresh cycle on separ
 - **Tracks drives** — automatically opens/closes drive sessions based on `running` + `speed`
 - **Tracks charges** — automatically opens/closes charge sessions based on `charging` state
 - **Recovers** on restart by checking the database for unclosed drives/charges
+- **Health monitoring** — HTTP `/healthz` endpoint, internal watchdog, and Docker `HEALTHCHECK` for automatic restart on stale MQTT
 
 ## Prerequisites
 
@@ -55,8 +56,9 @@ Add this service block to your existing TeslaMate `docker-compose.yml`:
       - MQTT_TOPIC_PREFIX=saic/you@email.com/vehicles/YOUR_VIN
       - DB_URI=postgres://teslamate:YOUR_PASSWORD@database:5432/mg_ismart?sslmode=disable
       - DRIVE_END_DEBOUNCE_SECONDS=180
+      - HEALTH_PORT=8080
+      - STALE_MINUTES=30
 ```
-
 
 Replace the placeholders:
 
@@ -84,6 +86,7 @@ You should see:
 {"level":"INFO","msg":"config loaded", ...}
 {"level":"INFO","msg":"database connected and schema ensured"}
 {"level":"INFO","msg":"state recovered", ...}
+{"level":"INFO","msg":"health endpoint started", "port":8080, ...}
 {"level":"INFO","msg":"mqtt connected, subscribing", ...}
 {"level":"INFO","msg":"mqtt subscribed successfully", ...}
 ```
@@ -96,6 +99,40 @@ You should see:
 | `MQTT_TOPIC_PREFIX` | **Yes** | — | Vehicle topic prefix, e.g. `saic/user@email.com/vehicles/VIN` |
 | `DB_URI` | **Yes** | — | PostgreSQL connection string (include `?sslmode=disable` for local containers) |
 | `DRIVE_END_DEBOUNCE_SECONDS` | No | `180` | Seconds at speed=0 before a drive is ended (avoids splitting drives at traffic lights) |
+| `HEALTH_PORT` | No | `8080` | Port for the HTTP health endpoint |
+| `STALE_MINUTES` | No | `30` | Minutes without MQTT messages before health reports unhealthy |
+
+## Health monitoring
+
+The service includes three layers of monitoring:
+
+### HTTP health endpoint
+
+```sh
+# From inside the Docker network
+curl http://saic2postgresql:8080/healthz
+
+# Returns 200 when healthy, 503 when stale:
+{"status":"ok","last_message_received":"2026-04-16T22:01:30Z","since_last_message":"45s","uptime":"1h23m"}
+```
+
+### Docker HEALTHCHECK
+
+Built into the image — Docker will automatically mark the container as `unhealthy` if no MQTT messages arrive within `STALE_MINUTES`. Combined with `restart: unless-stopped`, the container will be restarted automatically.
+
+Check health status:
+
+```sh
+docker inspect --format='{{.State.Health.Status}}' saic2postgresql
+```
+
+### Watchdog logging
+
+Every 5 minutes, the service logs its MQTT status. If messages stop arriving, you'll see warnings in the logs:
+
+```
+{"level":"WARN","msg":"watchdog: no MQTT messages received, subscription may be dead","since_last_message":"35m0s","threshold":"30m0s"}
+```
 
 ## Database schema
 
@@ -133,10 +170,6 @@ podman login docker.io
 go mod tidy
 go build -o saic-logger .
 ```
-
-## License
-
-MIT
 
 ## Backup and Restore
 
@@ -187,3 +220,7 @@ docker compose exec -T database psql -U teslamate -d mg_ismart < ./mg_ismart.bck
 # Restart saic2postgresql
 docker compose start saic2postgresql
 ```
+
+## License
+
+MIT

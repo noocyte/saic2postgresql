@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -23,6 +24,8 @@ func main() {
 		"mqtt_broker", cfg.MQTTBroker,
 		"mqtt_topic_prefix", cfg.MQTTTopicPrefix,
 		"drive_end_debounce_seconds", cfg.DriveEndDebounceSeconds,
+		"health_port", cfg.HealthPort,
+		"stale_minutes", cfg.StaleMinutes,
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -40,8 +43,13 @@ func main() {
 		slog.Warn("state recovery encountered an issue (continuing)", "error", err)
 	}
 
+	// Start health monitoring
+	hc := NewHealthCheck(cfg.StaleMinutes)
+	hc.StartHealthServer(ctx, cfg.HealthPort)
+	hc.StartWatchdog(ctx, 5*time.Minute)
+
 	slog.Info("starting MQTT connection")
-	if err := StartMQTT(ctx, cfg, vs); err != nil {
+	if err := StartMQTT(ctx, cfg, vs, hc); err != nil {
 		if ctx.Err() != nil {
 			slog.Info("shutting down gracefully")
 		} else {

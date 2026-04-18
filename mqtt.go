@@ -14,7 +14,7 @@ import (
 
 // StartMQTT connects to the MQTT broker, subscribes to the vehicle topic tree,
 // routes incoming messages to the VehicleState, and blocks until ctx is cancelled.
-func StartMQTT(ctx context.Context, cfg *Config, vs *VehicleState) error {
+func StartMQTT(ctx context.Context, cfg *Config, vs *VehicleState, hc *HealthCheck) error {
 	serverURL, err := url.Parse(cfg.MQTTBroker)
 	if err != nil {
 		return fmt.Errorf("parsing MQTT broker URL: %w", err)
@@ -54,6 +54,9 @@ func StartMQTT(ctx context.Context, cfg *Config, vs *VehicleState) error {
 					if !strings.HasPrefix(topic, prefix) {
 						return true, nil
 					}
+
+					// Record that we received a message
+					hc.RecordMessage()
 
 					suffix := strings.TrimPrefix(topic, prefix)
 

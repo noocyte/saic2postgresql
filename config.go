@@ -13,6 +13,8 @@ type Config struct {
 	MQTTTopicPrefix         string `env:"MQTT_TOPIC_PREFIX,required"`
 	DBURI                   string `env:"DB_URI,required"`
 	DriveEndDebounceSeconds int    `env:"DRIVE_END_DEBOUNCE_SECONDS" envDefault:"180"`
+	HealthPort              int    `env:"HEALTH_PORT" envDefault:"8080"`
+	StaleMinutes            int    `env:"STALE_MINUTES" envDefault:"30"`
 }
 
 // LoadConfig parses environment variables into a Config struct.
