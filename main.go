@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -10,6 +12,23 @@ import (
 )
 
 func main() {
+	// Health check mode: saic-logger --health [port]
+	if len(os.Args) > 1 && os.Args[1] == "--health" {
+		port := "8080"
+		if len(os.Args) > 2 {
+			port = os.Args[2]
+		}
+		resp, err := http.Get(fmt.Sprintf("http://localhost:%s/healthz", port))
+		if err != nil {
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	// Structured JSON logging to stdout
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
