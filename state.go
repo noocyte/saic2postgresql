@@ -94,15 +94,17 @@ type VehicleState struct {
 	ChargeStartKwh float64
 
 	// Dependencies
-	db  *pgxpool.Pool
-	cfg *Config
+	db   *pgxpool.Pool
+	cfg  *Config
+	osrm *OSRMClient
 }
 
 // NewVehicleState creates a new VehicleState wired to the database and config.
-func NewVehicleState(pool *pgxpool.Pool, cfg *Config) *VehicleState {
+func NewVehicleState(pool *pgxpool.Pool, cfg *Config, osrm *OSRMClient) *VehicleState {
 	return &VehicleState{
 		db:           pool,
 		cfg:          cfg,
+		osrm:         osrm,
 		CurrentState: StateParked,
 	}
 }
@@ -308,11 +310,23 @@ func (vs *VehicleState) transitionToParked(ctx context.Context, endTime time.Tim
 	prevState := vs.CurrentState
 
 	if vs.ActiveDriveID != nil {
-		err := EndDrive(ctx, vs.db, *vs.ActiveDriveID, endTime, vs.Odometer, vs.BatteryLevel, vs.LastPositionID)
+		driveID := *vs.ActiveDriveID
+		err := EndDrive(ctx, vs.db, driveID, endTime, vs.Odometer, vs.BatteryLevel, vs.LastPositionID)
 		if err != nil {
 			slog.Error("failed to end drive", "error", err)
+		} else if vs.osrm != nil {
+			// Run OSRM map matching asynchronously so it doesn't block state transitions
+			pool := vs.db
+			osrm := vs.osrm
+			go func() {
+				matchCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer cancel()
+				if err := MatchAndStoreDrive(matchCtx, pool, osrm, driveID); err != nil {
+					slog.Error("failed to map-match drive", "drive_id", driveID, "error", err)
+				}
+			}()
 		}
-		slog.Info("state transition", "from", "driving", "to", "parked", "drive_id", *vs.ActiveDriveID)
+		slog.Info("state transition", "from", "driving", "to", "parked", "drive_id", driveID)
 		vs.ActiveDriveID = nil
 	}
 

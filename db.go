@@ -49,6 +49,15 @@ CREATE TABLE IF NOT EXISTS charges (
     start_position_id INTEGER REFERENCES positions(id),
     end_position_id INTEGER REFERENCES positions(id)
 );
+
+CREATE TABLE IF NOT EXISTS matched_positions (
+    id SERIAL PRIMARY KEY,
+    drive_id INTEGER REFERENCES drives(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    latitude DOUBLE PRECISION NOT NULL,
+    longitude DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_matched_positions_drive ON matched_positions(drive_id, seq);
 `
 
 // RecoveredState holds state recovered from the database on startup.
@@ -208,4 +217,89 @@ func RecoverState(ctx context.Context, pool *pgxpool.Pool) (*RecoveredState, err
 	}
 
 	return rs, nil
+}
+
+// GetDrivePositions retrieves all GPS positions for a specific drive, ordered by time.
+func GetDrivePositions(ctx context.Context, pool *pgxpool.Pool, driveID int) ([]DrivePosition, error) {
+	rows, err := pool.Query(ctx,
+		`SELECT p.latitude, p.longitude, p.date
+		 FROM positions p
+		 JOIN drives d ON p.date BETWEEN d.start_date AND COALESCE(d.end_date, NOW())
+		 WHERE d.id = $1
+		   AND p.car_state = 'driving'
+		   AND p.latitude IS NOT NULL AND p.longitude IS NOT NULL
+		   AND p.latitude != 0 AND p.longitude != 0
+		 ORDER BY p.date`,
+		driveID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("querying drive positions: %w", err)
+	}
+	defer rows.Close()
+
+	var positions []DrivePosition
+	for rows.Next() {
+		var dp DrivePosition
+		if err := rows.Scan(&dp.Latitude, &dp.Longitude, &dp.Timestamp); err != nil {
+			return nil, fmt.Errorf("scanning drive position: %w", err)
+		}
+		positions = append(positions, dp)
+	}
+	return positions, rows.Err()
+}
+
+// StoreMatchedPath stores OSRM-matched coordinates for a drive.
+// It replaces any existing matched path for the drive (allowing re-matching).
+func StoreMatchedPath(ctx context.Context, pool *pgxpool.Pool, driveID int, points []MatchedPoint) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Delete existing matched positions for this drive
+	if _, err := tx.Exec(ctx, `DELETE FROM matched_positions WHERE drive_id = $1`, driveID); err != nil {
+		return fmt.Errorf("deleting old matched positions: %w", err)
+	}
+
+	// Batch insert new matched positions
+	for i, p := range points {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO matched_positions (drive_id, seq, latitude, longitude) VALUES ($1, $2, $3, $4)`,
+			driveID, i, p.Latitude, p.Longitude,
+		); err != nil {
+			return fmt.Errorf("inserting matched position %d: %w", i, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing matched positions: %w", err)
+	}
+
+	slog.Debug("stored matched path", "drive_id", driveID, "points", len(points))
+	return nil
+}
+
+// GetUnmatchedDrives returns IDs of completed drives that don't have matched positions yet.
+func GetUnmatchedDrives(ctx context.Context, pool *pgxpool.Pool) ([]int, error) {
+	rows, err := pool.Query(ctx,
+		`SELECT d.id FROM drives d
+		 WHERE d.end_date IS NOT NULL
+		   AND NOT EXISTS (SELECT 1 FROM matched_positions mp WHERE mp.drive_id = d.id)
+		 ORDER BY d.start_date`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("querying unmatched drives: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scanning drive id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }

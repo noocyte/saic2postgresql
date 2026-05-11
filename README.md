@@ -101,6 +101,98 @@ You should see:
 | `DRIVE_END_DEBOUNCE_SECONDS` | No | `180` | Seconds at speed=0 before a drive is ended (avoids splitting drives at traffic lights) |
 | `HEALTH_PORT` | No | `8080` | Port for the HTTP health endpoint |
 | `STALE_MINUTES` | No | `30` | Minutes without MQTT messages before health reports unhealthy |
+| `OSRM_URL` | No | *(empty = disabled)* | OSRM server URL for map matching (e.g. `http://osrm:5000`) |
+
+## OSRM Map Matching (optional)
+
+When GPS data is sparse (points every 30-40 seconds), the map in Grafana shows straight lines between points instead of following actual roads. OSRM map matching solves this by snapping your GPS traces to the real road network.
+
+### How it works
+
+1. When a drive ends, the service sends the GPS trace to a local OSRM server
+2. OSRM returns road-snapped coordinates that follow actual roads
+3. The matched path is stored in `matched_positions` and used by the Grafana dashboard
+4. Drives without matched data fall back to raw GPS positions automatically
+
+### Setup
+
+#### 1. Prepare the road network data (one-time, ~15 minutes)
+
+Copy `osrm-setup.sh` to your Docker Compose directory and run it:
+
+```sh
+chmod +x osrm-setup.sh
+./osrm-setup.sh
+```
+
+This downloads the Norway map (~1 GB) and processes it for OSRM. The resulting `osrm-data/` directory uses ~1.5 GB of disk space.
+
+> **Other countries:** Change the download URL in the script. Find your region at [download.geofabrik.de](https://download.geofabrik.de/).
+
+#### 2. Add the OSRM service to docker-compose.yml
+
+```yaml
+  osrm:
+    image: osrm/osrm-backend
+    restart: unless-stopped
+    volumes:
+      - ./osrm-data:/data
+    command: osrm-routed --algorithm mld /data/norway-latest.osrm
+```
+
+#### 3. Add OSRM_URL to your saic2postgresql service
+
+```yaml
+  saic2postgresql:
+    # ... existing config ...
+    environment:
+      # ... existing env vars ...
+      - OSRM_URL=http://osrm:5000
+    depends_on:
+      - mosquitto
+      - database
+      - osrm
+```
+
+#### 4. Start the services
+
+```sh
+docker compose up -d osrm saic2postgresql
+```
+
+#### 5. Backfill historical drives (optional)
+
+To map-match all your existing drives:
+
+```sh
+docker compose exec saic2postgresql /saic-logger --backfill
+```
+
+Check the logs:
+
+```sh
+docker compose logs saic2postgresql | grep backfill
+```
+
+### Updating map data
+
+OSRM uses a static extract of the road network. To update it (e.g., after new roads are built):
+
+```sh
+docker compose stop osrm
+rm -rf osrm-data/
+./osrm-setup.sh
+docker compose up -d osrm
+
+# Re-match all drives with the new road data
+docker compose exec saic2postgresql /saic-logger --backfill
+```
+
+### Resource usage
+
+- **Disk:** ~1.5 GB for Norway road network data
+- **RAM:** ~500 MB for the OSRM server (Norway)
+- **CPU:** Negligible during normal operation; brief spike during map matching
 
 ## Health monitoring
 

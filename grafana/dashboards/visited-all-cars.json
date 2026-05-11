@@ -255,7 +255,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  date_trunc('minute', timezone('UTC', date), '$__timezone') as time,\n  avg(latitude) as latitude,\n  avg(longitude) as longitude\nFROM positions\nWHERE $__timeFilter(date)\n  AND latitude IS NOT NULL AND longitude IS NOT NULL\n  AND latitude != 0 AND longitude != 0\n  AND 0 IN ($car)\nGROUP BY 1\nORDER BY 1",
+          "rawSql": "WITH drive_bounds AS (\n  SELECT id as drive_id, start_date, end_date\n  FROM drives\n  WHERE $__timeFilter(start_date) AND end_date IS NOT NULL\n),\nmatched AS (\n  SELECT\n    d.start_date + (mp.seq * interval '1 second') as time,\n    mp.latitude,\n    mp.longitude,\n    d.drive_id\n  FROM matched_positions mp\n  JOIN drive_bounds d ON d.drive_id = mp.drive_id\n),\nraw_drives AS (\n  SELECT\n    p.date as time,\n    p.latitude,\n    p.longitude,\n    d.drive_id\n  FROM positions p\n  JOIN drive_bounds d ON p.date BETWEEN d.start_date AND d.end_date\n  WHERE p.car_state = 'driving'\n    AND p.latitude IS NOT NULL AND p.longitude IS NOT NULL\n    AND p.latitude != 0 AND p.longitude != 0\n    AND NOT EXISTS (SELECT 1 FROM matched_positions mp2 WHERE mp2.drive_id = d.drive_id)\n),\ncombined AS (\n  SELECT time, latitude, longitude, drive_id FROM matched\n  UNION ALL\n  SELECT time, latitude, longitude, drive_id FROM raw_drives\n)\nSELECT time, latitude, longitude\nFROM combined\nWHERE 0 IN ($car)\nORDER BY drive_id, time",
           "refId": "MG",
           "sql": {
             "columns": [

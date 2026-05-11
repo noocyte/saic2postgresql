@@ -15,6 +15,7 @@ type Config struct {
 	DriveEndDebounceSeconds int    `env:"DRIVE_END_DEBOUNCE_SECONDS" envDefault:"180"`
 	HealthPort              int    `env:"HEALTH_PORT" envDefault:"8080"`
 	StaleMinutes            int    `env:"STALE_MINUTES" envDefault:"30"`
+	OSRMURL                 string `env:"OSRM_URL" envDefault:""`
 }
 
 // LoadConfig parses environment variables into a Config struct.

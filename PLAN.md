@@ -238,3 +238,145 @@ ENTRYPOINT ["/saic-logger"]
    - Plug in charger -> verify charges rows created and closed
    - Kill and restart the container -> verify state recovery from DB
 4. **Grafana:** Confirm basic queries work against the schema (SELECT from positions, drives, charges)
+
+
+---
+
+## Phase 2: OSRM Map Matching for Road-Snapped Drive Routes
+
+### Problem
+
+GPS data from the SAIC gateway arrives every ~30-40 seconds during drives, giving roughly 600m between points at highway speed. Grafana's geomap `route` layer connects these points with straight lines, which cuts corners on curves, interchanges, and winding roads. Additionally, some drives may have gaps in GPS data that create even longer straight-line artifacts.
+
+### Solution: Self-hosted OSRM Map Matching
+
+Use [OSRM (Open Source Routing Machine)](http://project-osrm.org/) to snap raw GPS traces to actual roads. OSRM's `/match/v1/driving/{coordinates}` API takes a series of GPS points with timestamps and returns the most likely road path.
+
+### Architecture
+
+```
+Drive ends → Collect positions → OSRM /match API → Store matched path → Grafana queries matched path
+```
+
+### Database Changes
+
+New table to store matched (road-snapped) coordinates per drive:
+
+```sql
+CREATE TABLE IF NOT EXISTS matched_positions (
+    id SERIAL PRIMARY KEY,
+    drive_id INTEGER REFERENCES drives(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,          -- ordering within the drive
+    latitude DOUBLE PRECISION NOT NULL,
+    longitude DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_matched_positions_drive ON matched_positions(drive_id, seq);
+```
+
+### OSRM Container Setup
+
+Add to docker-compose:
+
+```yaml
+osrm:
+  image: osrm/osrm-backend
+  restart: unless-stopped
+  volumes:
+    - ./osrm-data:/data
+  command: osrm-routed --algorithm mld /data/norway-latest.osrm
+  ports:
+    - "5000:5000"
+```
+
+One-time data prep (Norway extract, ~500MB RAM):
+
+```bash
+mkdir osrm-data && cd osrm-data
+wget https://download.geofabrik.de/europe/norway-latest.osm.pbf
+docker run -t -v $(pwd):/data osrm/osrm-backend osrm-extract -p /data/car.lua /data/norway-latest.osm.pbf
+docker run -t -v $(pwd):/data osrm/osrm-backend osrm-partition /data/norway-latest.osrm
+docker run -t -v $(pwd):/data osrm/osrm-backend osrm-customize /data/norway-latest.osrm
+```
+
+### Go Implementation
+
+New config env var:
+- `OSRM_URL` — default `http://osrm:5000` (empty = disabled)
+
+New file `osrm.go`:
+
+1. **`MatchDrive(ctx, driveID, positions []Position) ([]MatchedPoint, error)`**
+   - Build OSRM match request: `GET /match/v1/driving/{lon1},{lat1};{lon2},{lat2};...?timestamps={t1};{t2};...&geometries=geojson&overview=full`
+   - Parse response GeoJSON geometry → extract coordinate array
+   - Return matched coordinates with sequence numbers
+
+2. **`StoreMatchedPath(ctx, pool, driveID, points []MatchedPoint) error`**
+   - DELETE existing matched_positions for this drive_id (allow re-matching)
+   - Batch INSERT the new matched coordinates
+
+3. **Integration in `state.go`**: Call `MatchDrive` at the end of `transitionToParked` (when a drive ends), after `EndDrive` succeeds.
+
+4. **Backfill command**: Add a `-backfill` CLI flag that:
+   - Queries all drives that don't have matched_positions yet
+   - Runs map matching for each
+   - Useful for fixing historical data
+
+### Grafana Dashboard Update
+
+Replace the raw positions query with matched positions for the map:
+
+```sql
+-- Use matched path if available, fall back to raw positions
+WITH drive_data AS (
+  SELECT
+    d.id as drive_id,
+    d.start_date,
+    d.end_date
+  FROM drives d
+  WHERE $__timeFilter(d.start_date)
+),
+matched AS (
+  SELECT
+    mp.drive_id,
+    d.start_date + (mp.seq || ' seconds')::interval as time,
+    mp.latitude,
+    mp.longitude,
+    true as is_matched
+  FROM matched_positions mp
+  JOIN drive_data d ON d.drive_id = mp.drive_id
+),
+raw AS (
+  SELECT
+    NULL as drive_id,
+    p.date as time,
+    p.latitude,
+    p.longitude,
+    false as is_matched
+  FROM positions p
+  JOIN drive_data d ON p.date BETWEEN d.start_date AND COALESCE(d.end_date, NOW())
+  WHERE p.car_state = 'driving'
+    AND p.latitude IS NOT NULL AND p.longitude IS NOT NULL
+    AND p.latitude != 0 AND p.longitude != 0
+    AND NOT EXISTS (
+      SELECT 1 FROM matched_positions mp2 
+      WHERE mp2.drive_id = d.drive_id
+    )
+)
+SELECT time, latitude, longitude
+FROM (
+  SELECT * FROM matched
+  UNION ALL
+  SELECT * FROM raw
+) combined
+ORDER BY time
+```
+
+### Implementation Order
+
+1. Add OSRM container to docker-compose + prep Norway map data
+2. Create `matched_positions` table (add to `db.go` schema init)
+3. Implement `osrm.go` with match + store functions
+4. Integrate into drive-end transition in `state.go`
+5. Add `-backfill` CLI command
+6. Update Grafana dashboard query
+7. Test end-to-end with a real drive
