@@ -147,9 +147,10 @@ func (c *OSRMClient) matchSingle(ctx context.Context, positions []DrivePosition)
 }
 
 // matchInChunks splits large traces into overlapping chunks and merges results.
+// A failed chunk is skipped; the remaining chunks are still matched and appended.
 func (c *OSRMClient) matchInChunks(ctx context.Context, positions []DrivePosition, chunkSize int) ([]MatchedPoint, error) {
+	const overlap = 5 // overlap points between chunks for continuity
 	var allPoints []MatchedPoint
-	overlap := 5 // overlap points between chunks for continuity
 
 	for start := 0; start < len(positions); {
 		end := start + chunkSize
@@ -157,35 +158,52 @@ func (c *OSRMClient) matchInChunks(ctx context.Context, positions []DrivePositio
 			end = len(positions)
 		}
 
-		chunk := positions[start:end]
-		matched, err := c.matchSingle(ctx, chunk)
+		matched, err := c.matchSingle(ctx, positions[start:end])
 		if err != nil {
 			slog.Warn("OSRM chunk matching failed, skipping chunk", "start", start, "end", end, "error", err)
-			start = end - overlap
-			if start <= 0 {
-				start = end
-			}
-			continue
-		}
-
-		if matched != nil {
-			if len(allPoints) > 0 && start > 0 {
-				// Skip first few points of subsequent chunks (overlap region)
-				skipPoints := len(matched) / chunkSize * overlap
-				if skipPoints > 0 && skipPoints < len(matched) {
-					matched = matched[skipPoints:]
-				}
+		} else if len(matched) > 0 {
+			if len(allPoints) > 0 {
+				matched = trimOverlap(allPoints[len(allPoints)-1], matched)
 			}
 			allPoints = append(allPoints, matched...)
 		}
 
-		start = end - overlap
-		if start <= 0 || end == len(positions) {
+		if end == len(positions) {
 			break
 		}
+		// Step forward with overlap, but always make progress.
+		next := end - overlap
+		if next <= start {
+			next = end
+		}
+		start = next
 	}
 
 	return allPoints, nil
+}
+
+// overlapMaxDistSq is the maximum squared distance (in degrees²) for a point in a
+// new chunk to be considered the same location as the end of the previous chunk.
+// 0.001° is roughly 100 m.
+const overlapMaxDistSq = 0.001 * 0.001
+
+// trimOverlap removes the leading part of matched that duplicates geometry already
+// emitted by the previous chunk. It searches the first half of matched for the point
+// closest to last and drops everything up to and including it. If no point is close
+// enough (e.g. a previous chunk failed), matched is returned unchanged.
+func trimOverlap(last MatchedPoint, matched []MatchedPoint) []MatchedPoint {
+	searchLen := (len(matched) + 1) / 2
+	bestIdx := -1
+	bestDist := overlapMaxDistSq
+	for i := 0; i < searchLen; i++ {
+		dLat := matched[i].Latitude - last.Latitude
+		dLon := matched[i].Longitude - last.Longitude
+		if d := dLat*dLat + dLon*dLon; d <= bestDist {
+			bestDist = d
+			bestIdx = i
+		}
+	}
+	return matched[bestIdx+1:]
 }
 
 // MatchAndStoreDrive fetches positions for a drive, runs OSRM map matching, and stores the result.
@@ -209,7 +227,7 @@ func MatchAndStoreDrive(ctx context.Context, pool *pgxpool.Pool, osrm *OSRMClien
 		return fmt.Errorf("OSRM map matching: %w", err)
 	}
 
-	if matched == nil || len(matched) == 0 {
+	if len(matched) == 0 {
 		slog.Warn("no matched points returned", "drive_id", driveID)
 		return nil
 	}
