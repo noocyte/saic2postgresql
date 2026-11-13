@@ -14,15 +14,19 @@ import (
 func main() {
 	// Health check mode: saic-logger --health [port]
 	if len(os.Args) > 1 && os.Args[1] == "--health" {
+		// Port precedence: CLI arg, then HEALTH_PORT env, then 8080.
 		port := "8080"
 		if len(os.Args) > 2 {
 			port = os.Args[2]
+		} else if p := os.Getenv("HEALTH_PORT"); p != "" {
+			port = p
 		}
-		resp, err := http.Get(fmt.Sprintf("http://localhost:%s/healthz", port))
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Get(fmt.Sprintf("http://localhost:%s/healthz", port))
 		if err != nil {
 			os.Exit(1)
 		}
-		defer resp.Body.Close()
+		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			os.Exit(1)
 		}
@@ -51,45 +55,7 @@ func main() {
 	// Backfill mode: saic-logger --backfill
 	// Runs OSRM map matching on all historical drives that don't have matched positions.
 	if len(os.Args) > 1 && os.Args[1] == "--backfill" {
-		ctx := context.Background()
-
-		if cfg.OSRMURL == "" {
-			slog.Error("OSRM_URL must be set for backfill mode")
-			os.Exit(1)
-		}
-
-		pool, err := InitDB(ctx, cfg.DBURI)
-		if err != nil {
-			slog.Error("failed to initialize database", "error", err)
-			os.Exit(1)
-		}
-		defer pool.Close()
-
-		osrm := NewOSRMClient(cfg.OSRMURL)
-
-		drives, err := GetUnmatchedDrives(ctx, pool)
-		if err != nil {
-			slog.Error("failed to get unmatched drives", "error", err)
-			os.Exit(1)
-		}
-
-		if len(drives) == 0 {
-			slog.Info("no unmatched drives found, nothing to do")
-			os.Exit(0)
-		}
-
-		slog.Info("starting backfill", "unmatched_drives", len(drives))
-		succeeded, failed := 0, 0
-		for _, driveID := range drives {
-			if err := MatchAndStoreDrive(ctx, pool, osrm, driveID); err != nil {
-				slog.Error("backfill failed for drive", "drive_id", driveID, "error", err)
-				failed++
-			} else {
-				succeeded++
-			}
-		}
-		slog.Info("backfill complete", "succeeded", succeeded, "failed", failed, "total", len(drives))
-		os.Exit(0)
+		os.Exit(runBackfill(cfg))
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -131,4 +97,53 @@ func main() {
 	}
 
 	slog.Info("shutdown complete")
+}
+
+// runBackfill runs OSRM map matching on all historical drives that don't have
+// matched positions. It returns the process exit code.
+func runBackfill(cfg *Config) int {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	if cfg.OSRMURL == "" {
+		slog.Error("OSRM_URL must be set for backfill mode")
+		return 1
+	}
+
+	pool, err := InitDB(ctx, cfg.DBURI)
+	if err != nil {
+		slog.Error("failed to initialize database", "error", err)
+		return 1
+	}
+	defer pool.Close()
+
+	osrm := NewOSRMClient(cfg.OSRMURL)
+
+	drives, err := GetUnmatchedDrives(ctx, pool)
+	if err != nil {
+		slog.Error("failed to get unmatched drives", "error", err)
+		return 1
+	}
+
+	if len(drives) == 0 {
+		slog.Info("no unmatched drives found, nothing to do")
+		return 0
+	}
+
+	slog.Info("starting backfill", "unmatched_drives", len(drives))
+	succeeded, failed := 0, 0
+	for _, driveID := range drives {
+		if ctx.Err() != nil {
+			slog.Info("backfill interrupted", "succeeded", succeeded, "failed", failed, "remaining", len(drives)-succeeded-failed)
+			return 1
+		}
+		if err := MatchAndStoreDrive(ctx, pool, osrm, driveID); err != nil {
+			slog.Error("backfill failed for drive", "drive_id", driveID, "error", err)
+			failed++
+		} else {
+			succeeded++
+		}
+	}
+	slog.Info("backfill complete", "succeeded", succeeded, "failed", failed, "total", len(drives))
+	return 0
 }

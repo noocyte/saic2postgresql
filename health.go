@@ -20,10 +20,10 @@ type HealthCheck struct {
 
 // HealthResponse is returned as JSON from /healthz.
 type HealthResponse struct {
-	Status             string `json:"status"`
+	Status              string `json:"status"`
 	LastMessageReceived string `json:"last_message_received"`
-	SinceLastMessage   string `json:"since_last_message"`
-	Uptime             string `json:"uptime"`
+	SinceLastMessage    string `json:"since_last_message"`
+	Uptime              string `json:"uptime"`
 }
 
 // NewHealthCheck creates a new health checker with the given stale threshold.
@@ -72,6 +72,7 @@ func (h *HealthCheck) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		resp.SinceLastMessage = time.Since(lastMsg).Truncate(time.Second).String()
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	if h.IsHealthy() {
 		resp.Status = "ok"
 		w.WriteHeader(http.StatusOK)
@@ -80,7 +81,6 @@ func (h *HealthCheck) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 

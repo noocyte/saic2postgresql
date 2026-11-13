@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS matched_positions (
     longitude DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_matched_positions_drive ON matched_positions(drive_id, seq);
+
+ALTER TABLE charges ADD COLUMN IF NOT EXISTS start_kwh DOUBLE PRECISION;
 `
 
 // RecoveredState holds state recovered from the database on startup.
@@ -66,9 +68,7 @@ type RecoveredState struct {
 	ActiveDriveID  *int
 	ActiveChargeID *int
 	LastPositionID int
-	StartOdometer  float64
-	StartBattery   float64
-	ChargeStartKwh float64
+	ChargeStartKwh *float64 // nil if the charge predates start_kwh tracking
 }
 
 // InitDB connects to PostgreSQL and ensures the schema exists.
@@ -92,14 +92,14 @@ func InitDB(ctx context.Context, uri string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// InsertPosition inserts a snapshot into the positions table and returns the new row ID.
-func InsertPosition(ctx context.Context, pool *pgxpool.Pool, snap Snapshot) (int, error) {
+// InsertPosition inserts a snapshot into the positions table at the given time and returns the new row ID.
+func InsertPosition(ctx context.Context, pool *pgxpool.Pool, date time.Time, snap Snapshot) (int, error) {
 	var id int
 	err := pool.QueryRow(ctx,
 		`INSERT INTO positions (date, latitude, longitude, speed, power, charging_power, odometer, battery_level, outside_temp, car_state)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		 RETURNING id`,
-		time.Now(), snap.Latitude, snap.Longitude, snap.Speed, snap.Power,
+		date, snap.Latitude, snap.Longitude, snap.Speed, snap.Power,
 		snap.ChargingPower, snap.Odometer, snap.BatteryLevel, snap.OutsideTemp, snap.CarState,
 	).Scan(&id)
 	if err != nil {
@@ -139,13 +139,13 @@ func EndDrive(ctx context.Context, pool *pgxpool.Pool, id int, endDate time.Time
 }
 
 // StartCharge inserts a new charge row and returns its ID.
-func StartCharge(ctx context.Context, pool *pgxpool.Pool, startDate time.Time, startBattery float64, startPosID int) (int, error) {
+func StartCharge(ctx context.Context, pool *pgxpool.Pool, startDate time.Time, startBattery, startKwh float64, startPosID int) (int, error) {
 	var id int
 	err := pool.QueryRow(ctx,
-		`INSERT INTO charges (start_date, start_battery_level, start_position_id)
-		 VALUES ($1, $2, $3)
+		`INSERT INTO charges (start_date, start_battery_level, start_kwh, start_position_id)
+		 VALUES ($1, $2, $3, $4)
 		 RETURNING id`,
-		startDate, startBattery, startPosID,
+		startDate, startBattery, startKwh, startPosID,
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("starting charge: %w", err)
@@ -153,8 +153,8 @@ func StartCharge(ctx context.Context, pool *pgxpool.Pool, startDate time.Time, s
 	return id, nil
 }
 
-// EndCharge closes out a charge row with end data.
-func EndCharge(ctx context.Context, pool *pgxpool.Pool, id int, endDate time.Time, endBattery, energyAdded float64, endPosID int) error {
+// EndCharge closes out a charge row with end data. A nil energyAdded is stored as NULL.
+func EndCharge(ctx context.Context, pool *pgxpool.Pool, id int, endDate time.Time, endBattery float64, energyAdded *float64, endPosID int) error {
 	_, err := pool.Exec(ctx,
 		`UPDATE charges
 		 SET end_date = $2, end_battery_level = $3, energy_added = $4, end_position_id = $5
@@ -176,15 +176,12 @@ func RecoverState(ctx context.Context, pool *pgxpool.Pool) (*RecoveredState, err
 
 	// Check for unclosed drive
 	var driveID int
-	var startOdo, startBattery float64
 	err := pool.QueryRow(ctx,
-		`SELECT id, start_odometer, start_battery_level FROM drives WHERE end_date IS NULL ORDER BY start_date DESC LIMIT 1`,
-	).Scan(&driveID, &startOdo, &startBattery)
+		`SELECT id FROM drives WHERE end_date IS NULL ORDER BY start_date DESC LIMIT 1`,
+	).Scan(&driveID)
 	if err == nil {
 		rs.CurrentState = StateDriving
 		rs.ActiveDriveID = &driveID
-		rs.StartOdometer = startOdo
-		rs.StartBattery = startBattery
 		slog.Info("recovered unclosed drive", "drive_id", driveID)
 	} else if err != pgx.ErrNoRows {
 		slog.Warn("error querying unclosed drives", "error", err)
@@ -192,14 +189,14 @@ func RecoverState(ctx context.Context, pool *pgxpool.Pool) (*RecoveredState, err
 
 	// Check for unclosed charge
 	var chargeID int
-	var chargeBattery float64
+	var startKwh *float64
 	err = pool.QueryRow(ctx,
-		`SELECT id, start_battery_level FROM charges WHERE end_date IS NULL ORDER BY start_date DESC LIMIT 1`,
-	).Scan(&chargeID, &chargeBattery)
+		`SELECT id, start_kwh FROM charges WHERE end_date IS NULL ORDER BY start_date DESC LIMIT 1`,
+	).Scan(&chargeID, &startKwh)
 	if err == nil {
 		rs.CurrentState = StateCharging
 		rs.ActiveChargeID = &chargeID
-		rs.StartBattery = chargeBattery
+		rs.ChargeStartKwh = startKwh
 		slog.Info("recovered unclosed charge", "charge_id", chargeID)
 	} else if err != pgx.ErrNoRows {
 		slog.Warn("error querying unclosed charges", "error", err)
@@ -262,14 +259,15 @@ func StoreMatchedPath(ctx context.Context, pool *pgxpool.Pool, driveID int, poin
 		return fmt.Errorf("deleting old matched positions: %w", err)
 	}
 
-	// Batch insert new matched positions
-	for i, p := range points {
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO matched_positions (drive_id, seq, latitude, longitude) VALUES ($1, $2, $3, $4)`,
-			driveID, i, p.Latitude, p.Longitude,
-		); err != nil {
-			return fmt.Errorf("inserting matched position %d: %w", i, err)
-		}
+	// Bulk insert new matched positions via COPY
+	if _, err := tx.CopyFrom(ctx,
+		pgx.Identifier{"matched_positions"},
+		[]string{"drive_id", "seq", "latitude", "longitude"},
+		pgx.CopyFromSlice(len(points), func(i int) ([]any, error) {
+			return []any{driveID, i, points[i].Latitude, points[i].Longitude}, nil
+		}),
+	); err != nil {
+		return fmt.Errorf("copying matched positions: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {

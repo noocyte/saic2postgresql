@@ -16,7 +16,7 @@ import (
 type State int
 
 const (
-	StateParked   State = iota
+	StateParked State = iota
 	StateDriving
 	StateCharging
 )
@@ -91,7 +91,7 @@ type VehicleState struct {
 	LastSnapshot   Snapshot
 	HasSnapshot    bool
 	SpeedZeroSince *time.Time
-	ChargeStartKwh float64
+	ChargeStartKwh *float64 // nil if unknown (e.g. charge recovered from before start_kwh was tracked)
 
 	// Dependencies
 	db   *pgxpool.Pool
@@ -173,6 +173,10 @@ func (vs *VehicleState) EvaluateSnapshot(ctx context.Context) {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
+	// Single timestamp shared by the position row and any drive/charge start,
+	// so the first position of a drive falls within its [start_date, end_date].
+	now := time.Now()
+
 	// Determine car_state
 	carState := vs.determineCarState()
 
@@ -195,12 +199,12 @@ func (vs *VehicleState) EvaluateSnapshot(ctx context.Context) {
 	if vs.HasSnapshot && snap.Equal(vs.LastSnapshot) {
 		slog.Debug("snapshot unchanged, skipping insert")
 		// Still evaluate transitions (e.g., debounce timer may expire)
-		vs.evaluateTransitions(ctx)
+		vs.evaluateTransitions(ctx, now)
 		return
 	}
 
 	// Insert position
-	posID, err := InsertPosition(ctx, vs.db, snap)
+	posID, err := InsertPosition(ctx, vs.db, now, snap)
 	if err != nil {
 		slog.Error("failed to insert position", "error", err)
 		return
@@ -212,7 +216,7 @@ func (vs *VehicleState) EvaluateSnapshot(ctx context.Context) {
 	slog.Debug("position inserted", "id", posID, "state", carState, "soc", vs.BatteryLevel, "speed", vs.Speed)
 
 	// Evaluate state transitions
-	vs.evaluateTransitions(ctx)
+	vs.evaluateTransitions(ctx, now)
 }
 
 func (vs *VehicleState) determineCarState() string {
@@ -228,9 +232,7 @@ func (vs *VehicleState) determineCarState() string {
 	return "offline"
 }
 
-func (vs *VehicleState) evaluateTransitions(ctx context.Context) {
-	now := time.Now()
-
+func (vs *VehicleState) evaluateTransitions(ctx context.Context, now time.Time) {
 	switch vs.CurrentState {
 	case StateParked:
 		// Parked -> Driving
@@ -295,20 +297,19 @@ func (vs *VehicleState) transitionToDriving(ctx context.Context, now time.Time) 
 }
 
 func (vs *VehicleState) transitionToCharging(ctx context.Context, now time.Time) {
-	chargeID, err := StartCharge(ctx, vs.db, now, vs.BatteryLevel, vs.LastPositionID)
+	chargeID, err := StartCharge(ctx, vs.db, now, vs.BatteryLevel, vs.BatteryKwh, vs.LastPositionID)
 	if err != nil {
 		slog.Error("failed to start charge", "error", err)
 		return
 	}
 	vs.ActiveChargeID = &chargeID
-	vs.ChargeStartKwh = vs.BatteryKwh
+	startKwh := vs.BatteryKwh
+	vs.ChargeStartKwh = &startKwh
 	vs.CurrentState = StateCharging
 	slog.Info("state transition", "from", "parked", "to", "charging", "charge_id", chargeID)
 }
 
 func (vs *VehicleState) transitionToParked(ctx context.Context, endTime time.Time) {
-	prevState := vs.CurrentState
-
 	if vs.ActiveDriveID != nil {
 		driveID := *vs.ActiveDriveID
 		err := EndDrive(ctx, vs.db, driveID, endTime, vs.Odometer, vs.BatteryLevel, vs.LastPositionID)
@@ -331,18 +332,22 @@ func (vs *VehicleState) transitionToParked(ctx context.Context, endTime time.Tim
 	}
 
 	if vs.ActiveChargeID != nil {
-		energyAdded := vs.BatteryKwh - vs.ChargeStartKwh
+		var energyAdded *float64
+		if vs.ChargeStartKwh != nil {
+			e := vs.BatteryKwh - *vs.ChargeStartKwh
+			energyAdded = &e
+		}
 		err := EndCharge(ctx, vs.db, *vs.ActiveChargeID, endTime, vs.BatteryLevel, energyAdded, vs.LastPositionID)
 		if err != nil {
 			slog.Error("failed to end charge", "error", err)
 		}
 		slog.Info("state transition", "from", "charging", "to", "parked", "charge_id", *vs.ActiveChargeID)
 		vs.ActiveChargeID = nil
+		vs.ChargeStartKwh = nil
 	}
 
 	vs.SpeedZeroSince = nil
 	vs.CurrentState = StateParked
-	_ = prevState // used for logging above
 }
 
 // --- Parsing helpers ---
