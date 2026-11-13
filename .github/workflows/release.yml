@@ -1,0 +1,72 @@
+# Releases and Docker images.
+#
+# On every push to master, release-please keeps one "chore(master): release X.Y.Z"
+# PR up to date (version from fix:/feat: commits, CHANGELOG.md, version.txt).
+# Merging that PR creates the tag vX.Y.Z and a GitHub Release, and the
+# docker job below builds linux/amd64 + linux/arm64 and pushes
+#   noocyte/saic2postgresql:vX.Y.Z, :X.Y and :latest
+# to Docker Hub.
+#
+# Needs: repo secrets DOCKERHUB_USERNAME + DOCKERHUB_TOKEN (Docker Hub access
+# token, Read & Write), and Settings → Actions → General → "Allow GitHub
+# Actions to create and approve pull requests".
+name: release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  docker:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: noocyte/saic2postgresql
+          tags: |
+            type=semver,pattern=v{{version}},value=${{ needs.release-please.outputs.tag_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs.tag_name }}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
