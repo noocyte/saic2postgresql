@@ -244,16 +244,27 @@ Three tables are created automatically in the `mg_ismart` database:
           Speed=0 for debounce
 ```
 
+## Releases
+
+Releases are automatic, via [release-please](https://github.com/googleapis/release-please)
+and GitHub Actions (`.github/workflows/release.yml`):
+
+1. Write commits as `fix: ...` (bumps 0.1.3 → 0.1.4) or `feat: ...`
+   (bumps → 0.2.0). Other prefixes (`chore:`, `docs:`) don't trigger a release.
+2. After each merge to `master`, release-please updates one open PR named
+   "chore(master): release X.Y.Z" with the version and `CHANGELOG.md`.
+3. Merge that PR when you want a release. It tags `vX.Y.Z`, creates a GitHub
+   Release, and builds + pushes `noocyte/saic2postgresql:vX.Y.Z`, `:X.Y` and
+   `:latest` (linux/amd64 + linux/arm64) to Docker Hub.
+
+The current version is in `version.txt`; don't edit it by hand.
+
 ## Building from source
 
-### With Podman
+### Image, locally (Podman or Docker)
 
 ```sh
-# Login to Docker Hub
-podman login docker.io
-
-# Build and push (multi-arch: amd64 + arm64)
-./build.sh v1.0.0
+podman build -t saic2postgresql:dev .
 ```
 
 ### Locally with Go
